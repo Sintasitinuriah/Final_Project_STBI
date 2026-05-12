@@ -15,7 +15,7 @@ Sistem rekomendasi kafe berbasis web yang dibangun menggunakan **Python**, **Str
 * **Bahasa Pemrograman**: Python 3.x
 * **Framework Web**: [Streamlit](https://finalprojectstbi-djvb5qzd6uresg3zyvmshn.streamlit.app/)
 * **QR Akses aplikasi** :
-![QR Code Aplikasi](qr-code.png "Title" {width=40px height=400px})
+![QR Code Aplikasi](qr-code.png 400x)
 * **Analisis Data**: Pandas, NumPy
 * **Machine Learning**: Scikit-Learn (TF-IDF Vectorizer, Cosine Similarity)
 * **Model Persistence**: Pickle / Joblib
