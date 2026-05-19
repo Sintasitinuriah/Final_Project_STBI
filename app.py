@@ -4,30 +4,73 @@ import numpy as np
 import pickle
 from sklearn.metrics.pairwise import cosine_similarity
 
-# --- 1. DEFINISI CLASS ---
+# --- 1. DEFINISI CLASS (SUDAH DIREVISI) ---
 class ContentBasedFilteringKafe:
-    def __init__(self, tfidf_matrix, sim_matrix, dokumen_kafe):
+    def __init__(self, tfidf_matrix, sim_matrix, dokumen_kafe, tfidf_vectorizer=None):
         self.tfidf_matrix = tfidf_matrix
         self.sim_matrix   = sim_matrix
         self.df_kafe      = dokumen_kafe.copy().reset_index(drop=True)
+        self.vectorizer   = tfidf_vectorizer
         self.nama_ke_idx  = pd.Series(self.df_kafe.index, index=self.df_kafe['nama_kafe'])
+        
+        # Inisialisasi parameter IMDb
+        self.C = self.df_kafe['rata_rating'].mean()
+        self.m = 5
+        self._hitung_skor_kualitas_global()
 
-    def rekomendasikan(self, list_kafe, top_n=5):
+    def _hitung_skor_kualitas_global(self):
+        """Menghitung skor kualitas berbobot (IMDb) untuk setiap kafe"""
+        v = self.df_kafe['jumlah_ulasan']
+        R = self.df_kafe['rata_rating']
+        
+        # Rumus IMDb
+        skor_kualitas = (v / (v + self.m) * R) + (self.m / (v + self.m) * self.C)
+        self.df_kafe['skor_kualitas_norm'] = skor_kualitas / 5.0
+
+    def _get_top_keywords(self, row_idx, top_k=3):
+        """Mengambil kata kunci dominan dari matriks TF-IDF"""
+        if self.vectorizer is None:
+            return "Kata kunci tidak tersedia"
+            
+        row_vector = self.tfidf_matrix[row_idx].toarray().flatten()
+        top_word_indices = np.argsort(row_vector)[::-1][:top_k]
+        feature_names = self.vectorizer.get_feature_names_out()
+        top_words = [feature_names[i] for i in top_word_indices if row_vector[i] > 0]
+        
+        return ", ".join(top_words) if top_words else "-"
+
+    def rekomendasikan(self, list_kafe, top_n=5, alpha=0.7):
+        """Fungsi rekomendasi dengan Hybrid Reranking (Teks + Rating)"""
         idx_pilihan = [self.nama_ke_idx[n] for n in list_kafe if n in self.nama_ke_idx]
         if not idx_pilihan: return pd.DataFrame()
 
+        # 1. Hitung profil teks pengguna & kemiripannya
         vektor_profil = np.average(self.tfidf_matrix[idx_pilihan].toarray(), axis=0)
-        skor = cosine_similarity(vektor_profil.reshape(1, -1), self.tfidf_matrix).flatten()
+        skor_teks = cosine_similarity(vektor_profil.reshape(1, -1), self.tfidf_matrix).flatten()
         
-        skor[idx_pilihan] = -1.0
-        top_idx = np.argsort(skor)[::-1][:top_n]
+        # 2. Hitung Skor Akhir (Hybrid: alpha% Teks + beta% Rating Kualitas)
+        beta = 1.0 - alpha
+        skor_kualitas = self.df_kafe['skor_kualitas_norm'].values
+        skor_akhir = (alpha * skor_teks) + (beta * skor_kualitas)
+        
+        # 3. Blokir kafe yang sudah dipilih agar tidak direkomendasikan ulang
+        skor_akhir[idx_pilihan] = -1.0
+        
+        # 4. Ambil Top N
+        top_idx = np.argsort(skor_akhir)[::-1][:top_n]
+        
+        # 5. Ekstrak kata kunci untuk kafe-kafe yang direkomendasikan
+        keywords_list = [self._get_top_keywords(i, top_k=4) for i in top_idx]
         
         return pd.DataFrame({
             'Nama Kafe'        : self.df_kafe.loc[top_idx, 'nama_kafe'].values,
-            'Similarity Score' : skor[top_idx].round(4),
+            'Text Sim Score'   : skor_teks[top_idx].round(4),
+            'Final Score'      : skor_akhir[top_idx].round(4),
             'Rating'           : self.df_kafe.loc[top_idx, 'rata_rating'].values,
             'Ulasan'           : self.df_kafe.loc[top_idx, 'jumlah_ulasan'].values,
+            'Keywords'         : keywords_list
         })
+
 
 # --- 2. LOAD DATA ---
 @st.cache_resource
@@ -35,39 +78,65 @@ def load_data():
     try:
         with open('model_kafe.pkl', 'rb') as f:
             data = pickle.load(f)
-        return ContentBasedFilteringKafe(data['tfidf_matrix'], data['sim_matrix'], data['df_kafe'])
-    except:
+            
+        # Ambil vectorizer jika ada, jika tidak gunakan None agar tidak error
+        vectorizer = data.get('vectorizer', None)
+        
+        return ContentBasedFilteringKafe(
+            tfidf_matrix=data['tfidf_matrix'], 
+            sim_matrix=data['sim_matrix'], 
+            dokumen_kafe=data['df_kafe'],
+            tfidf_vectorizer=vectorizer
+        )
+    except Exception as e:
+        st.error(f"Gagal memuat model: {e}")
         return None
 
 # --- 3. UI UTAMA ---
 def main():
     st.set_page_config(page_title="Cafe Finder Hub", layout="wide")
-    st.title("☕ Cafe Recommendation System")
+    st.title("☕ Smart Cafe Recommendation System")
+    st.markdown("Sistem rekomendasi berbasis **Content-Based Filtering** dengan analisis teks ulasan (NLP) dan pembobotan kualitas kafe.")
     st.markdown("---")
 
     model = load_data()
     if not model:
-        st.error("Model tidak ditemukan.")
         return
 
     # --- SIDEBAR ---
     st.sidebar.header("🔍 Cari & Bandingkan")
-    jml_input = st.sidebar.number_input("Jumlah kafe acuan:", min_value=1, max_value=10, value=1)
+    jml_input = st.sidebar.number_input("Jumlah kafe acuan:", min_value=1, max_value=5, value=1)
     
     list_kafe_db = model.df_kafe['nama_kafe'].tolist()
     kafe_dipilih = []
 
     for i in range(int(jml_input)):
-        pilihan = st.sidebar.selectbox(f"Kafe {i+1}:", list_kafe_db, key=f"kafe_{i}")
+        pilihan = st.sidebar.selectbox(f"Kafe Acuan {i+1}:", list_kafe_db, key=f"kafe_{i}")
         kafe_dipilih.append(pilihan)
 
+    # Pengaturan Alpha & Beta (Teks vs Rating)
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("⚙️ Pengaturan Bobot Algoritma")
+    alpha_val = st.sidebar.slider("Fokus Kemiripan Ulasan (%)", min_value=0, max_value=100, value=70, step=10)
+    alpha = alpha_val / 100.0
+    st.sidebar.caption(f"*Sisa {100 - alpha_val}% akan fokus pada rating & kualitas tempat.*")
+    
     top_n = st.sidebar.slider("Jumlah Rekomendasi:", 1, 12, 6)
     btn_rekomendasi = st.sidebar.button("Dapatkan Rekomendasi ✨")
 
     # --- BAGIAN HASIL REKOMENDASI ---
     if btn_rekomendasi:
-        st.success(f"Daftar Rekomendasi Berdasarkan {len(set(kafe_dipilih))} Pilihanmu:")
-        hasil = model.rekomendasikan(list(set(kafe_dipilih)), top_n=top_n)
+        kafe_unik = list(set(kafe_dipilih))
+        
+        # Ekstrak kata kunci dari kafe acuan untuk ditampilkan ke user
+        kata_kunci_acuan = []
+        for kafe in kafe_unik:
+            idx = model.nama_ke_idx[kafe]
+            kata_kunci_acuan.append(model._get_top_keywords(idx, top_k=3))
+            
+        st.info(f"**Menganalisis karakteristik dari:** {', '.join(kafe_unik)}\n\n**Topik Ulasan Dominan:** *{', '.join(set(kata_kunci_acuan))}*")
+        
+        hasil = model.rekomendasikan(kafe_unik, top_n=top_n, alpha=alpha)
         
         if not hasil.empty:
             cols_rek = st.columns(3)
@@ -75,35 +144,35 @@ def main():
                 with cols_rek[idx % 3]:
                     with st.container(border=True):
                         st.markdown(f"#### {row['Nama Kafe']}")
-                        st.write(f"⭐ **Rating:** {row['Rating']}")
-                        st.caption(f"Match: {int(row['Similarity Score']*100)}% | {row['Ulasan']} ulasan")
+                        st.write(f"⭐ **{row['Rating']}** ({row['Ulasan']} ulasan)")
+                        st.markdown(f"🏷️ **Vibe:** *{row['Keywords']}*")
+                        
+                        # Progress bar visual untuk skor
+                        st.progress(min(row['Final Score'], 1.0))
+                        st.caption(f"Match Score: {int(row['Final Score']*100)}% | Teks: {int(row['Text Sim Score']*100)}%")
         st.divider()
 
     # --- BAGIAN JELAJAH KAFE (TABEL & RINGKASAN) ---
     st.subheader("🏙️ Jelajahi Semua Kafe")
     
-    # 1. Ringkasan Bintang (Metrics)
     total_kafe = len(model.df_kafe)
-    bintang_5 = len(model.df_kafe[model.df_kafe['rata_rating'] >= 5.0])
-    bintang_4_keatas = len(model.df_kafe[(model.df_kafe['rata_rating'] >= 4.0) & (model.df_kafe['rata_rating'] < 5.0)])
+    bintang_5 = len(model.df_kafe[model.df_kafe['rata_rating'] >= 4.5])
+    bintang_4_keatas = len(model.df_kafe[(model.df_kafe['rata_rating'] >= 4.0) & (model.df_kafe['rata_rating'] < 4.5)])
     kurang_dari_4 = len(model.df_kafe[model.df_kafe['rata_rating'] < 4.0])
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total Kafe", total_kafe)
-    m2.metric("⭐⭐⭐⭐⭐ (5.0)", bintang_5)
-    m3.metric("⭐⭐⭐⭐ (4.0 - 4.9)", bintang_4_keatas)
+    m2.metric("⭐⭐⭐⭐⭐ (≥ 4.5)", bintang_5)
+    m3.metric("⭐⭐⭐⭐ (4.0 - 4.4)", bintang_4_keatas)
     m4.metric("⭐ (< 4.0)", kurang_dari_4)
 
     st.write("Gunakan tabel di bawah untuk melihat detail atau mencari nama kafe:")
 
-    # 2. Tampilan Tabel
-    # Kita rapikan kolom agar enak dibaca
     df_display = model.df_kafe[['nama_kafe', 'rata_rating', 'jumlah_ulasan']].copy()
     df_display.columns = ['Nama Kafe', 'Rating', 'Total Ulasan']
     
-    # Menampilkan tabel dengan fitur pencarian dan sorting bawaan Streamlit
     st.dataframe(
-        df_display.sort_values(by='Rating', ascending=False), 
+        df_display.sort_values(by='Total Ulasan', ascending=False), 
         use_container_width=True, 
         hide_index=True
     )
