@@ -4,7 +4,7 @@ import numpy as np
 import pickle
 from sklearn.metrics.pairwise import cosine_similarity
 
-# --- 1. DEFINISI CLASS (SUDAH DIREVISI) ---
+# --- 1. DEFINISI CLASS (SUDAH DIOPTIMALKAN UNTUK VIBES) ---
 class ContentBasedFilteringKafe:
     def __init__(self, tfidf_matrix, sim_matrix, dokumen_kafe, tfidf_vectorizer=None):
         self.tfidf_matrix = tfidf_matrix
@@ -27,17 +27,52 @@ class ContentBasedFilteringKafe:
         skor_kualitas = (v / (v + self.m) * R) + (self.m / (v + self.m) * self.C)
         self.df_kafe['skor_kualitas_norm'] = skor_kualitas / 5.0
 
-    def _get_top_keywords(self, row_idx, top_k=3):
-        """Mengambil kata kunci dominan dari matriks TF-IDF"""
-        if self.vectorizer is None:
-            return "Kata kunci tidak tersedia"
-            
-        row_vector = self.tfidf_matrix[row_idx].toarray().flatten()
-        top_word_indices = np.argsort(row_vector)[::-1][:top_k]
-        feature_names = self.vectorizer.get_feature_names_out()
-        top_words = [feature_names[i] for i in top_word_indices if row_vector[i] > 0]
+    def _get_top_keywords(self, row_idx, top_k=4):
+        """
+        Mengambil kata kunci dominan/vibes dengan SMART FALLBACK MECHANISM.
+        Jika vectorizer kosong, data diekstrak dari kolom tag hasil olahan dataset.
+        """
+        # LAYER 1: Ekstraksi Berbasis Pembobotan TF-IDF (Jika Vectorizer Tersedia)
+        if self.vectorizer is not None:
+            try:
+                row_vector = self.tfidf_matrix[row_idx].toarray().flatten()
+                # Hanya pilih kata yang memiliki bobot TF-IDF > 0
+                non_zero_indices = np.where(row_vector > 0)[0]
+                if len(non_zero_indices) > 0:
+                    top_indices = non_zero_indices[np.argsort(row_vector[non_zero_indices])[::-1][:top_k]]
+                    feature_names = self.vectorizer.get_feature_names_out()
+                    top_words = [feature_names[i].title() for i in top_indices]
+                    if top_words:
+                        return ", ".join(top_words)
+            except Exception:
+                pass # Jika ada error kalkulasi, otomatis lari ke Layer 2
+                
+        # LAYER 2: Fallback Ekstraksi Langsung dari Kolom Deskripsi/Tag Vibe Karakteristik
+        row_data = self.df_kafe.iloc[row_idx]
+        extracted_tags = []
         
-        return ", ".join(top_words) if top_words else "-"
+        kolom_vibe_sumber = ['tag_kebisingan', 'tag_makanan', 'tag_suasana', 'tag_layanan']
+        for col in kolom_vibe_sumber:
+            if col in self.df_kafe.columns and pd.notna(row_data[col]):
+                val_str = str(row_data[col]).strip()
+                if val_str:
+                    # Pecah kalimat berdasarkan spasi/koma, ambil kata unik berkarakter > 3 huruf
+                    words = [w.strip().title() for w in val_str.replace(',', ' ').split() if len(w.strip()) > 3]
+                    extracted_tags.extend(words)
+                    
+        # Hilangkan duplikasi kata tanpa merusak urutan asli
+        unique_tags = list(dict.fromkeys(extracted_tags))[:top_k]
+        if unique_tags:
+            return ", ".join(unique_tags)
+            
+        # LAYER 3: Fallback Terakhir dari Dokumen Gabungan
+        if 'dokumen_gabungan' in self.df_kafe.columns:
+            words = [w.title() for w in str(row_data['dokumen_gabungan']).split() if len(w) > 4]
+            unique_words = list(dict.fromkeys(words))[:top_k]
+            if unique_words:
+                return ", ".join(unique_words)
+                
+        return "Cozy, Cafe Jogja" # Default jika kosong sama sekali
 
     def rekomendasikan(self, list_kafe, top_n=5, alpha=0.7):
         """Fungsi rekomendasi dengan Hybrid Reranking (Teks + Rating)"""
@@ -76,16 +111,26 @@ class ContentBasedFilteringKafe:
 @st.cache_resource
 def load_data():
     try:
-        with open('model_kafe.pkl', 'rb') as f:
-            data = pickle.load(f)
+        # Menangani fleksibilitas nama file pkl proyekmu
+        try:
+            with open('model_kafe.pkl', 'rb') as f:
+                data = pickle.load(f)
+        except FileNotFoundError:
+            with open('model_kafe_jogja.pkl', 'rb') as f:
+                data = pickle.load(f)
             
-        # Ambil vectorizer jika ada, jika tidak gunakan None agar tidak error
+        # Ambil dataframe secara fleksibel berdasarkan key yang tersimpan di .pkl
+        df_kafe_key = data.get('df_kafe', data.get('dokumen_kafe', None))
         vectorizer = data.get('vectorizer', None)
+        
+        if df_kafe_key is None:
+            st.error("Format dataframe di dalam file pickle tidak dikenali.")
+            return None
         
         return ContentBasedFilteringKafe(
             tfidf_matrix=data['tfidf_matrix'], 
             sim_matrix=data['sim_matrix'], 
-            dokumen_kafe=data['df_kafe'],
+            dokumen_kafe=df_kafe_key,
             tfidf_vectorizer=vectorizer
         )
     except Exception as e:
@@ -134,7 +179,7 @@ def main():
             idx = model.nama_ke_idx[kafe]
             kata_kunci_acuan.append(model._get_top_keywords(idx, top_k=3))
             
-        st.info(f"**Menganalisis karakteristik dari:** {', '.join(kafe_unik)}\n\n**Topik Ulasan Dominan:** *{', '.join(set(kata_kunci_acuan))}*")
+        st.info(f"**Menganalisis karakteristik dari:** {', '.join(kafe_unik)}\n\n**Topik/Vibe Dominan Acuan:** *{', '.join(set(kata_kunci_acuan))}*")
         
         hasil = model.rekomendasikan(kafe_unik, top_n=top_n, alpha=alpha)
         
@@ -145,11 +190,17 @@ def main():
                     with st.container(border=True):
                         st.markdown(f"#### {row['Nama Kafe']}")
                         st.write(f"⭐ **{row['Rating']}** ({row['Ulasan']} ulasan)")
+                        
+                        # Menampilkan Vibes dengan gaya italic tebal yang rapi
                         st.markdown(f"🏷️ **Vibe:** *{row['Keywords']}*")
                         
-                        # Progress bar visual untuk skor
-                        st.progress(min(row['Final Score'], 1.0))
-                        st.caption(f"Match Score: {int(row['Final Score']*100)}% | Teks: {int(row['Text Sim Score']*100)}%")
+                        # Keamanan Progress Bar (Clipped antara 0.0 - 1.0 agar UI Streamlit tidak crash)
+                        progress_score = float(np.clip(row['Final Score'], 0.0, 1.0))
+                        st.progress(progress_score)
+                        st.caption(f"Match Score: {int(progress_score*100)}% | Teks Sim: {int(row['Text Sim Score']*100)}%")
+        else:
+            st.warning("Tidak ada rekomendasi yang ditemukan.")
+            
         st.divider()
 
     # --- BAGIAN JELAJAH KAFE (TABEL & RINGKASAN) ---
